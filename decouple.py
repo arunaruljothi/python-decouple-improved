@@ -4,7 +4,7 @@ import sys
 import string
 from shlex import shlex
 from io import open
-from typing import Any, Callable, Dict, TypeVar, overload
+from typing import Callable, Dict, List, Set, TypeVar, cast as cast_type
 
 from configparser import ConfigParser, NoOptionError
 text_type = str
@@ -12,7 +12,6 @@ text_type = str
 
 DEFAULT_ENCODING = 'UTF-8'
 T = TypeVar('T')
-R = TypeVar('R')
 
 # Python 3.10 don't have strtobool anymore. So we move it here.
 TRUE_VALUES = {"y", "yes", "t", "true", "on", "1"}
@@ -30,6 +29,14 @@ def strtobool(value):
 
     raise ValueError("Invalid truth value: " + value)
 
+def _caller_path():
+    # MAGIC! Get the caller's module path.
+    frame = sys._getframe()
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if frame is not None:
+        return frame.f_code.co_filename
+    return None
 
 class UndefinedValueError(Exception):
     pass
@@ -143,9 +150,9 @@ class Undefined(object):
 # Reference instance to represent undefined values
 undefined = Undefined()
 
+
 def _cast_do_nothing(value: str) -> str:
     return value
-
 
 
 class Config(object):
@@ -163,39 +170,19 @@ class Config(object):
         value = str(value)
         return bool(value) if value == '' else bool(strtobool(value))
 
-    @overload
     def get(
         self,
-        option,
-        *,
-        default: str | Undefined = undefined,
-        cast: Callable[[str], str] = _cast_do_nothing,
-    ) -> str:
-        ...
-
-    @overload
-    def get(
-        self,
-        option,
+        option: str,
         *,
         default: T | Undefined = undefined,
-        cast: Callable[[str], T],
+        cast: Callable[[str], T] = _cast_do_nothing,
     ) -> T:
-        ...
-
-    def get(
-        self,
-        option,
-        *,
-        default: Any | Undefined = undefined,
-        cast: Callable[[str], Any] = _cast_do_nothing,
-    ) -> Any:
         """
         Return the value for option or default if defined.
         """
 
         if cast is bool:
-            cast = self._cast_boolean
+            cast = cast_type(Callable[[str], T], self._cast_boolean)
 
         # We can't avoid __contains__ because value may be empty.
         if option in os.environ:
@@ -203,141 +190,112 @@ class Config(object):
         elif option in self.repository:
             value = cast(self.repository[option])
         else:
+            # do not cast the default value
             if isinstance(default, Undefined):
                 raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
             value = default
 
         return value
 
-    @overload
-    def __call__(
-        self,
-        option,
-        *,
-        default: str | Undefined = undefined,
-        cast: Callable[[str], str] = _cast_do_nothing,
-    ) -> str:
-        ...
-
-    @overload
-    def __call__(
-        self,
-        option,
-        *,
-        default: T | Undefined = undefined,
-        cast: Callable[[str], T],
-    ) -> T:
-        ...
-
-    def __call__(
-        self,
-        option,
-        *,
-        default: Any | Undefined = undefined,
-        cast: Callable[[str], Any] = _cast_do_nothing,
-    ) -> Any:
-        """
-        Convenient shortcut to get.
-        """
-        return self.get(option, default=default, cast=cast)
-
 
 class SuperConfig(object):
     """
-    Autodetects multi config files. If the config file matches the
+    Autodetects multiple config files. If the config file matches the
     extension and is in the search path, it will be loaded.
     Else if the filename matches the direct list, it will be loaded.
+    Is lazy, if the config is found before all the search paths are checked,
+    it will stop searching for now.
 
     Parameters
     ----------
     search_paths : strs, optional
         Initial search paths. Automatically includes caller's path.
     """
-    EXTS = {'.env': RepositoryEnv, '.ini': RepositoryIni}
+    EXTS = {'env': RepositoryEnv, 'ini': RepositoryIni}
     DIRECT = ['.env', 'settings.ini']
 
     def __init__(self, *search_paths: str):
-        self.search_paths = search_paths
-        self.configs = []
-        self.config_paths = set()
+        self._configs: List[Config] = []
+        self._explicit_search_paths = search_paths
+        self._searched_paths: Set[str] = set()
+        self._will_search_paths = set(search_paths)
 
-    def _load_in_dir(self, path: str):
-        # if the path is in search_paths and extension matches, load it.
-        # else if the filename matches direct, load it.
-        for filename in os.listdir(path):
-            name, ext = os.path.splitext(os.path.basename(filename))
-            ext = name if name.startswith('.') else ext
-            if (
-                (path in self.search_paths and ext in self.EXTS)
-                or filename in self.DIRECT
-            ):
-                full_path = os.path.join(path, filename)
-                if full_path not in self.config_paths:
-                    self.config_paths.add(full_path)
-                    self.configs.append(Config(self.EXTS[ext](os.path.join(path, filename))))
-
-
-    def _find_files(self, path: str):
-        self._load_in_dir(path)
-        parent = os.path.dirname(path)
+    def _load_file(self, path: str):
+        filename = os.path.basename(path)
+        if '.' not in filename:
+            return
+        _, ext = filename.rsplit('.', 1)
         if (
-            parent
-            and os.path.normcase(parent) != os.path.normcase(os.path.abspath(os.sep))
-            and path != os.getcwd()
+            (
+                os.path.dirname(path) in self._explicit_search_paths
+                and ext in self.EXTS
+            ) or filename in self.DIRECT
         ):
-            self._find_files(parent)
+            self._configs.append(Config(self.EXTS[ext](path)))
 
-    def _caller_path(self):
-        # MAGIC! Get the caller's module path.
-        frame = sys._getframe()
-        path = os.path.dirname(frame.f_back.f_back.f_code.co_filename) # type: ignore
-        return path
+    def _search_path(self, path: str):
+        if path in self._searched_paths:
+            return
 
-    @overload
+        # check if parent is valid and add it to will search
+        parent = os.path.abspath(os.path.dirname(path))
+        cwd = os.getcwd()
+        if os.path.commonpath([parent, cwd]) == cwd:
+            self._will_search_paths.add(parent)
+
+        # search the path
+        if os.path.isdir(path):
+            for filename in os.listdir(path):
+                self._load_file(os.path.join(path, filename))
+
+        self._searched_paths.add(path)
+
     def __call__(
         self,
-        option,
-        *,
-        default: str | Undefined = undefined,
-        cast: Callable[[str], str] = _cast_do_nothing,
-    ) -> str:
-        ...
-
-    @overload
-    def __call__(
-        self,
-        option,
+        option: str,
         *,
         default: T | Undefined = undefined,
-        cast: Callable[[str], T],
+        cast: Callable[[str], T] = _cast_do_nothing,
     ) -> T:
-        ...
+        """
+        Get the value for the option from the configs lazily.
 
-    def __call__(
-        self,
-        option,
-        *,
-        default: Any | Undefined = undefined,
-        cast: Callable[[str], Any] = _cast_do_nothing,
-    ) -> Any:
-        if not len(self.configs):
-            for path in [self._caller_path(), *self.search_paths]:
-                self._find_files(path)
-
-        for idx, config in enumerate(self.configs):
+        :param str option: config option name
+        :param T | Undefined default: default value, defaults to undefined
+        :param Callable[[str], T] cast: cast function, defaults to _cast_do_nothing
+        :raises UndefinedValueError: when the option is not found and no default is defined
+        :return T: the value for the option
+        """
+        for config in self._configs:
             try:
-                # default only on last one
-                if idx == len(self.configs) - 1:
-                    return config(option, default=default, cast=cast)
-                return config(option, cast=cast)
+                return config.get(option, cast=cast)
             except UndefinedValueError:
                 pass
-        raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
 
+        if self._will_search_paths:
+            path = self._will_search_paths.pop()
+            self._search_path(path)
+            return self(option, default=default, cast=cast)
 
-# A pré-instantiated AutoConfig to improve decouple's usability
-# now just import config and start using with no configuration.
-config = SuperConfig()
+        if not isinstance(default, Undefined):
+            return default
+        raise UndefinedValueError(
+            f'{option} not found. Declare it as envvar or define a default value.'
+        )
+
+    def expand(self, *search_paths: str) -> "SuperConfig":
+        """
+        Add search paths to the config loader, including the caller's path.
+        """
+        new_config = SuperConfig()
+        new_config._explicit_search_paths = self._explicit_search_paths + search_paths
+        new_config._will_search_paths = self._will_search_paths.union(set(search_paths))
+        new_config._searched_paths = self._searched_paths
+        caller_path = _caller_path()
+        if caller_path is not None:
+            new_config._will_search_paths.add(caller_path)
+        return self
+
 
 # Helpers
 
@@ -359,7 +317,7 @@ class Csv(object):
         self.strip = strip
         self.post_process = post_process
 
-    def __call__(self, value):
+    def __call__(self, value: str | None) -> List[str]:
         """The actual transformation"""
         if value is None:
             return self.post_process()

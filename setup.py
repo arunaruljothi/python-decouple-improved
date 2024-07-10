@@ -27,4 +27,6 @@ setup(name='python-decouple-improved',
           'Programming Language :: Python :: 3',
           'Topic :: Software Development :: Libraries',
       ],
-      url='http://github.com/henriquebastos/python-decouple/',)
+      url='http://github.com/henriquebastos/python-decouple/',
+      python_requires='>=3.10',
+)
