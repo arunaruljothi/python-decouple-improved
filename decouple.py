@@ -4,27 +4,15 @@ import sys
 import string
 from shlex import shlex
 from io import open
-from collections import OrderedDict
+from typing import Any, Callable, Dict, TypeVar, overload
 
-# Useful for very coarse version differentiation.
-PYVERSION = sys.version_info
-
-
-if PYVERSION >= (3, 0, 0):
-    from configparser import ConfigParser, NoOptionError
-    text_type = str
-else:
-    from ConfigParser import SafeConfigParser as ConfigParser, NoOptionError
-    text_type = unicode
-
-if PYVERSION >= (3, 2, 0):
-    read_config = lambda parser, file: parser.read_file(file)
-else:
-    read_config = lambda parser, file: parser.readfp(file)
+from configparser import ConfigParser, NoOptionError
+text_type = str
 
 
 DEFAULT_ENCODING = 'UTF-8'
-
+T = TypeVar('T')
+R = TypeVar('R')
 
 # Python 3.10 don't have strtobool anymore. So we move it here.
 TRUE_VALUES = {"y", "yes", "t", "true", "on", "1"}
@@ -47,67 +35,18 @@ class UndefinedValueError(Exception):
     pass
 
 
-class Undefined(object):
-    """
-    Class to represent undefined type.
-    """
-    pass
+class Repository(object):
+    def __init__(self, source='', encoding=DEFAULT_ENCODING):
+        pass
+
+    def __contains__(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def __getitem__(self, key: str) -> str:
+        raise NotImplementedError
 
 
-# Reference instance to represent undefined values
-undefined = Undefined()
-
-
-class Config(object):
-    """
-    Handle .env file format used by Foreman.
-    """
-
-    def __init__(self, repository):
-        self.repository = repository
-
-    def _cast_boolean(self, value):
-        """
-        Helper to convert config values to boolean as ConfigParser do.
-        """
-        value = str(value)
-        return bool(value) if value == '' else bool(strtobool(value))
-
-    @staticmethod
-    def _cast_do_nothing(value):
-        return value
-
-    def get(self, option, default=undefined, cast=undefined):
-        """
-        Return the value for option or default if defined.
-        """
-
-        # We can't avoid __contains__ because value may be empty.
-        if option in os.environ:
-            value = os.environ[option]
-        elif option in self.repository:
-            value = self.repository[option]
-        else:
-            if isinstance(default, Undefined):
-                raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
-
-            value = default
-
-        if isinstance(cast, Undefined):
-            cast = self._cast_do_nothing
-        elif cast is bool:
-            cast = self._cast_boolean
-
-        return cast(value)
-
-    def __call__(self, *args, **kwargs):
-        """
-        Convenient shortcut to get.
-        """
-        return self.get(*args, **kwargs)
-
-
-class RepositoryEmpty(object):
+class RepositoryEmpty(Repository):
     def __init__(self, source='', encoding=DEFAULT_ENCODING):
         pass
 
@@ -118,34 +57,41 @@ class RepositoryEmpty(object):
         return None
 
 
-class RepositoryIni(RepositoryEmpty):
+class RepositoryIni(Repository):
     """
     Retrieves option keys from .ini files.
+    Supports multiple sections.
     """
     SECTION = 'settings'
 
-    def __init__(self, source, encoding=DEFAULT_ENCODING):
+    def __init__(self, source: str, encoding=DEFAULT_ENCODING):
         self.parser = ConfigParser()
         with open(source, encoding=encoding) as file_:
-            read_config(self.parser, file_)
+            self.parser.read_file(file_)
 
-    def __contains__(self, key):
-        return (key in os.environ or
-                self.parser.has_option(self.SECTION, key))
+    def __contains__(self, key: str) -> bool:
+        if '.' in key:
+            section, value = key.rsplit('.', 1)
+            return self.parser.has_option(section, value)
+        return self.parser.has_option(self.SECTION, key)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> str:
         try:
-            return self.parser.get(self.SECTION, key)
+            if '.' in key:
+                section, value = key.rsplit('.', 1)
+                return self.parser.get(section, value)
+            else:
+                return self.parser.get(self.SECTION, key)
         except NoOptionError:
             raise KeyError(key)
 
 
-class RepositoryEnv(RepositoryEmpty):
+class RepositoryEnv(Repository):
     """
     Retrieves option keys from .env files with fall back to os.environ.
     """
-    def __init__(self, source, encoding=DEFAULT_ENCODING):
-        self.data = {}
+    def __init__(self, source: str, encoding=DEFAULT_ENCODING):
+        self.data: Dict[str, str] = {}
 
         with open(source, encoding=encoding) as file_:
             for line in file_:
@@ -159,10 +105,10 @@ class RepositoryEnv(RepositoryEmpty):
                     v = v[1:-1]
                 self.data[k] = v
 
-    def __contains__(self, key):
-        return key in os.environ or key in self.data
+    def __contains__(self, key: str) -> bool:
+        return key in self.data
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> str:
         return self.data[key]
 
 
@@ -174,83 +120,224 @@ class RepositorySecret(RepositoryEmpty):
     """
 
     def __init__(self, source='/run/secrets/'):
-        self.data = {}
+        self.data: Dict[str, str] = {}
 
         ls = os.listdir(source)
         for file in ls:
             with open(os.path.join(source, file), 'r') as f:
                 self.data[file] = f.read()
 
-    def __contains__(self, key):
-        return key in os.environ or key in self.data
+    def __contains__(self, key) -> bool:
+        return key in self.data
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> str:
         return self.data[key]
 
 
-class AutoConfig(object):
+class Undefined(object):
     """
-    Autodetects the config file and type.
+    Class to represent undefined type.
+    """
+
+
+# Reference instance to represent undefined values
+undefined = Undefined()
+
+def _cast_do_nothing(value: str) -> str:
+    return value
+
+
+
+class Config(object):
+    """
+    Handle .env file format used by Foreman.
+    """
+
+    def __init__(self, repository: Repository):
+        self.repository = repository
+
+    def _cast_boolean(self, value: str) -> bool:
+        """
+        Helper to convert config values to boolean as ConfigParser do.
+        """
+        value = str(value)
+        return bool(value) if value == '' else bool(strtobool(value))
+
+    @overload
+    def get(
+        self,
+        option,
+        *,
+        default: str | Undefined = undefined,
+        cast: Callable[[str], str] = _cast_do_nothing,
+    ) -> str:
+        ...
+
+    @overload
+    def get(
+        self,
+        option,
+        *,
+        default: T | Undefined = undefined,
+        cast: Callable[[str], T],
+    ) -> T:
+        ...
+
+    def get(
+        self,
+        option,
+        *,
+        default: Any | Undefined = undefined,
+        cast: Callable[[str], Any] = _cast_do_nothing,
+    ) -> Any:
+        """
+        Return the value for option or default if defined.
+        """
+
+        if cast is bool:
+            cast = self._cast_boolean
+
+        # We can't avoid __contains__ because value may be empty.
+        if option in os.environ:
+            value = cast(os.environ[option])
+        elif option in self.repository:
+            value = cast(self.repository[option])
+        else:
+            if isinstance(default, Undefined):
+                raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
+            value = default
+
+        return value
+
+    @overload
+    def __call__(
+        self,
+        option,
+        *,
+        default: str | Undefined = undefined,
+        cast: Callable[[str], str] = _cast_do_nothing,
+    ) -> str:
+        ...
+
+    @overload
+    def __call__(
+        self,
+        option,
+        *,
+        default: T | Undefined = undefined,
+        cast: Callable[[str], T],
+    ) -> T:
+        ...
+
+    def __call__(
+        self,
+        option,
+        *,
+        default: Any | Undefined = undefined,
+        cast: Callable[[str], Any] = _cast_do_nothing,
+    ) -> Any:
+        """
+        Convenient shortcut to get.
+        """
+        return self.get(option, default=default, cast=cast)
+
+
+class SuperConfig(object):
+    """
+    Autodetects multi config files. If the config file matches the
+    extension and is in the search path, it will be loaded.
+    Else if the filename matches the direct list, it will be loaded.
 
     Parameters
     ----------
-    search_path : str, optional
-        Initial search path. If empty, the default search path is the
-        caller's path.
-
+    search_paths : strs, optional
+        Initial search paths. Automatically includes caller's path.
     """
-    SUPPORTED = OrderedDict([
-        ('settings.ini', RepositoryIni),
-        ('.env', RepositoryEnv),
-    ])
+    EXTS = {'.env': RepositoryEnv, '.ini': RepositoryIni}
+    DIRECT = ['.env', 'settings.ini']
 
-    encoding = DEFAULT_ENCODING
+    def __init__(self, *search_paths: str):
+        self.search_paths = search_paths
+        self.configs = []
+        self.config_paths = set()
 
-    def __init__(self, search_path=None):
-        self.search_path = search_path
-        self.config = None
+    def _load_in_dir(self, path: str):
+        # if the path is in search_paths and extension matches, load it.
+        # else if the filename matches direct, load it.
+        for filename in os.listdir(path):
+            name, ext = os.path.splitext(os.path.basename(filename))
+            ext = name if name.startswith('.') else ext
+            if (
+                (path in self.search_paths and ext in self.EXTS)
+                or filename in self.DIRECT
+            ):
+                full_path = os.path.join(path, filename)
+                if full_path not in self.config_paths:
+                    self.config_paths.add(full_path)
+                    self.configs.append(Config(self.EXTS[ext](os.path.join(path, filename))))
 
-    def _find_file(self, path):
-        # look for all files in the current path
-        for configfile in self.SUPPORTED:
-            filename = os.path.join(path, configfile)
-            if os.path.isfile(filename):
-                return filename
 
-        # search the parent
+    def _find_files(self, path: str):
+        self._load_in_dir(path)
         parent = os.path.dirname(path)
-        if parent and os.path.normcase(parent) != os.path.normcase(os.path.abspath(os.sep)):
-            return self._find_file(parent)
-
-        # reached root without finding any files.
-        return ''
-
-    def _load(self, path):
-        # Avoid unintended permission errors
-        try:
-            filename = self._find_file(os.path.abspath(path))
-        except Exception:
-            filename = ''
-        Repository = self.SUPPORTED.get(os.path.basename(filename), RepositoryEmpty)
-
-        self.config = Config(Repository(filename, encoding=self.encoding))
+        if (
+            parent
+            and os.path.normcase(parent) != os.path.normcase(os.path.abspath(os.sep))
+            and path != os.getcwd()
+        ):
+            self._find_files(parent)
 
     def _caller_path(self):
         # MAGIC! Get the caller's module path.
         frame = sys._getframe()
-        path = os.path.dirname(frame.f_back.f_back.f_code.co_filename)
+        path = os.path.dirname(frame.f_back.f_back.f_code.co_filename) # type: ignore
         return path
 
-    def __call__(self, *args, **kwargs):
-        if not self.config:
-            self._load(self.search_path or self._caller_path())
+    @overload
+    def __call__(
+        self,
+        option,
+        *,
+        default: str | Undefined = undefined,
+        cast: Callable[[str], str] = _cast_do_nothing,
+    ) -> str:
+        ...
 
-        return self.config(*args, **kwargs)
+    @overload
+    def __call__(
+        self,
+        option,
+        *,
+        default: T | Undefined = undefined,
+        cast: Callable[[str], T],
+    ) -> T:
+        ...
+
+    def __call__(
+        self,
+        option,
+        *,
+        default: Any | Undefined = undefined,
+        cast: Callable[[str], Any] = _cast_do_nothing,
+    ) -> Any:
+        if not len(self.configs):
+            for path in [self._caller_path(), *self.search_paths]:
+                self._find_files(path)
+
+        for idx, config in enumerate(self.configs):
+            try:
+                # default only on last one
+                if idx == len(self.configs) - 1:
+                    return config(option, default=default, cast=cast)
+                return config(option, cast=cast)
+            except UndefinedValueError:
+                pass
+        raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
 
 
 # A pré-instantiated AutoConfig to improve decouple's usability
 # now just import config and start using with no configuration.
-config = AutoConfig()
+config = SuperConfig()
 
 # Helpers
 

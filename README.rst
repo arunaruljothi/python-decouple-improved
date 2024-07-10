@@ -1,4 +1,8 @@
 ========================================================
+Python Decouple Improved: Add typing, support multiple files, sections in toml, and more
+========================================================
+
+========================================================
 Python Decouple: Strict separation of settings from code
 ========================================================
 
@@ -406,8 +410,8 @@ Frequently Asked Questions
 
     import os
     from decouple import Config, RepositoryEnv
-    
-    
+
+
     config = Config(RepositoryEnv("path/to/.env"))
 
 
@@ -418,8 +422,8 @@ Frequently Asked Questions
 
     import os
     from decouple import Config, RepositoryEnv
-    
-    
+
+
     config = Config(RepositoryEnv("path/to/.env"))
 
 
@@ -430,8 +434,8 @@ Frequently Asked Questions
 
     import os
     from decouple import Config, RepositoryEnv
-    
-    
+
+
     config = Config(RepositoryEnv("path/to/somefile-like-env"))
 
 
@@ -442,8 +446,8 @@ Frequently Asked Questions
 
     import os
     from decouple import Config, RepositoryEnv
-    
-    
+
+
     DOTENV_FILE = os.environ.get("DOTENV_FILE", ".env") # only place using os.environ
     config = Config(RepositoryEnv(DOTENV_FILE))
 
@@ -455,8 +459,8 @@ Frequently Asked Questions
 
     from collections import ChainMap
     from decouple import Config, RepositoryEnv
-    
-    
+
+
     config = Config(ChainMap(RepositoryEnv(".private.env"), RepositoryEnv(".env")))
 
 
