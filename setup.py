@@ -5,11 +5,11 @@ import os
 
 README = os.path.join(os.path.dirname(__file__), 'README.rst')
 
-setup(name='python-decouple',
-      version='3.8',
-      description='Strict separation of settings from code.',
+setup(name='python-decouple-improved',
+      version='3.9',
+      description='Strict separation of settings from code. (Improved)',
       long_description=open(README).read(),
-      author="Henrique Bastos", author_email="henrique@bastos.net",
+      author="Henrique Bastos, Arun Aruljothi", author_email="henrique@bastos.net, arun@arunaruljothi.com",
       license="MIT",
       py_modules=['decouple'],
       zip_safe=False,
